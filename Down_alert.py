@@ -61,13 +61,13 @@ SUDDEN_JUMP_RATIO = 3       # current vs previous reading (sudden = 3x+)
 MIN_SPIKE_VALUE = 10         # ignore spikes below this many reports
 
 # Groq Vision API (FREE — https://console.groq.com)
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # Telegram Bot (FREE — @BotFather)
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8602412499:AAHhE-bB5px6TBu7On4AUjfJ0fKA-cBJW88")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-5249407319")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 SCREENSHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshots")
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
@@ -944,10 +944,27 @@ def run_test():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Agent 1 — UPI Downtime Monitor")
-    parser.add_argument("--test", action="store_true", help="Run one cycle and exit")
+    parser.add_argument("--test", action="store_true", help="Run tests and exit")
+    parser.add_argument("--once", action="store_true", help="Check all services once and exit")
     args = parser.parse_args()
 
     if args.test:
         run_test()
+    elif args.once:
+        # Single run mode (for GitHub Actions / cron)
+        agent = Agent1()
+        agent._start_browser()
+        try:
+            for name, url in SERVICES.items():
+                try:
+                    agent.check_once(name, url)
+                except Exception as e:
+                    log.error(f"[{name}] Check failed: {e}")
+                    agent._stop_browser()
+                    agent._start_browser()
+                time.sleep(5)
+        finally:
+            agent._stop_browser()
+        log.info("Single run complete.")
     else:
         Agent1().run()
