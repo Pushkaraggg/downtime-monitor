@@ -15,7 +15,7 @@ Alert logic:
 
 Spike definition:
   A spike = sudden jump where the latest value is 5x+ higher
-  than the average of recent readings, AND the jump happened
+  than the average of recent readings, AND the jump happened 
   in one step (not gradual). Example:
     [0, 1, 0, 2, 1, 150] → SPIKE (sudden jump from ~1 to 150)
     [10, 20, 30, 60, 100] → NOT a spike (gradual rise)
@@ -33,6 +33,16 @@ import os
 import re
 import time
 from datetime import datetime
+
+# Load .env file if it exists (keeps keys out of code)
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
 
 import requests
 from selenium import webdriver
@@ -217,20 +227,31 @@ class Agent1:
     # -----------------------------------------------------------------
     def _start_browser(self):
         opts = Options()
-        opts.add_argument("--headless=new")
+        # Auto-detect: headless on Linux (GitHub Actions), off-screen on Windows (local)
+        if os.name == "nt":
+            # Windows: real window off-screen (bypasses Cloudflare)
+            opts.add_argument("--window-position=-3000,-3000")
+        else:
+            # Linux/GitHub Actions: headless (no display available)
+            opts.add_argument("--headless=new")
         opts.add_argument("--disable-gpu")
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--window-size=1920,1080")
-        opts.add_argument(
-            "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-        )
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
         chrome_bin = os.environ.get("CHROME_BIN")
         if chrome_bin:
             opts.binary_location = chrome_bin
         self.driver = webdriver.Chrome(options=opts)
-        log.info("Chrome started (headless)")
+        # Anti-bot detection
+        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            """
+        })
+        log.info("Chrome started (minimized window)")
 
     def _stop_browser(self):
         if self.driver:
@@ -275,7 +296,36 @@ class Agent1:
         Returns a list of y-values like [0, 1, 0, 2, 1, 0, 150, 200].
         This is the RAW DATA — no AI, no guessing.
         """
-        # Strategy 1: Highcharts JS API
+        # Strategy 1: React Fiber (Recharts — new Downdetector UI)
+        try:
+            data = self.driver.execute_script("""
+                var wrapper = document.querySelector('.recharts-wrapper');
+                if (!wrapper) return null;
+                var keys = Object.keys(wrapper);
+                var fiberKey = keys.find(function(k) {
+                    return k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance');
+                });
+                if (!fiberKey) return null;
+                var node = wrapper[fiberKey];
+                for (var i = 0; i < 20; i++) {
+                    if (!node) break;
+                    if (node.memoizedProps && node.memoizedProps.data) {
+                        var d = node.memoizedProps.data;
+                        if (Array.isArray(d) && d.length > 5 && d[0].value !== undefined) {
+                            return d.map(function(p) { return p.value || 0; });
+                        }
+                    }
+                    node = node.return;
+                }
+                return null;
+            """)
+            if data and len(data) > 0:
+                log.info(f"Layer 1: React Fiber → {len(data)} values, last 5: {data[-5:]}")
+                return [float(v) for v in data]
+        except Exception as e:
+            log.debug(f"React Fiber extraction failed: {e}")
+
+        # Strategy 2: Highcharts JS API (older Downdetector UI)
         try:
             data = self.driver.execute_script("""
                 if (typeof Highcharts !== 'undefined' && Highcharts.charts) {
@@ -291,117 +341,10 @@ class Agent1:
                 return null;
             """)
             if data and len(data) > 0:
-                log.info(f"Layer 1: Highcharts API → {len(data)} values, last 5: {data[-5:]}")
+                log.info(f"Layer 1: Highcharts → {len(data)} values, last 5: {data[-5:]}")
                 return [float(v) for v in data]
         except Exception as e:
-            log.debug(f"Highcharts API failed: {e}")
-
-        # Strategy 2: Get chart data from SVG directly (read bar heights)
-        try:
-            data = self.driver.execute_script("""
-                var svg = document.querySelector('svg.highcharts-root')
-                       || document.querySelector('.highcharts-container svg');
-                if (!svg) return null;
-
-                // Try area/path series data points
-                var points = svg.querySelectorAll('.highcharts-series .highcharts-point, .highcharts-series rect');
-                if (points.length > 0) {
-                    var plotBox = svg.querySelector('.highcharts-plot-background');
-                    if (plotBox) {
-                        var plotHeight = parseFloat(plotBox.getAttribute('height'));
-                        var plotY = parseFloat(plotBox.getAttribute('y'));
-                        var values = [];
-                        points.forEach(function(p) {
-                            var h = parseFloat(p.getAttribute('height') || 0);
-                            values.push(h);
-                        });
-                        return values;
-                    }
-                }
-
-                // Try reading from the Highcharts internal store on the container
-                var containers = document.querySelectorAll('.highcharts-container');
-                for (var i = 0; i < containers.length; i++) {
-                    var parent = containers[i].parentElement;
-                    if (parent && parent.__highcharts_chart !== undefined) {
-                        var idx = parent.__highcharts_chart;
-                        if (Highcharts.charts[idx]) {
-                            return Highcharts.charts[idx].series[0].data.map(function(p) { return p.y || 0; });
-                        }
-                    }
-                }
-
-                return null;
-            """)
-            if data and len(data) > 0:
-                log.info(f"Layer 1: SVG/container → {len(data)} values, last 5: {data[-5:]}")
-                return [float(v) for v in data]
-        except Exception as e:
-            log.debug(f"SVG extraction failed: {e}")
-
-        # Strategy 3: Intercept XHR data from page scripts/network
-        try:
-            data = self.driver.execute_script("""
-                // Check for data in window/global scope
-                var candidates = ['__dd_chart_data', 'chartData', 'reportData', 'graphData'];
-                for (var i = 0; i < candidates.length; i++) {
-                    if (window[candidates[i]]) return window[candidates[i]];
-                }
-
-                // Check all script tags for embedded JSON data arrays
-                var scripts = document.querySelectorAll('script:not([src])');
-                for (var i = 0; i < scripts.length; i++) {
-                    var txt = scripts[i].textContent;
-                    // Look for arrays of [timestamp, value] pairs
-                    var match = txt.match(/\\[\\s*\\[\\s*\\d{10,13}\\s*,\\s*\\d+/);
-                    if (match) {
-                        // Extract the full array
-                        var start = txt.indexOf(match[0]);
-                        var depth = 0, end = start;
-                        for (var j = start; j < txt.length; j++) {
-                            if (txt[j] === '[') depth++;
-                            if (txt[j] === ']') depth--;
-                            if (depth === 0) { end = j + 1; break; }
-                        }
-                        try {
-                            var arr = JSON.parse(txt.substring(start, end));
-                            if (arr.length > 5) return arr;
-                        } catch(e) {}
-                    }
-                }
-                return null;
-            """)
-            if data and len(data) > 0:
-                if isinstance(data[0], list):
-                    values = [float(p[1]) for p in data]
-                else:
-                    values = [float(v) for v in data]
-                log.info(f"Layer 1: Script/XHR → {len(values)} values, last 5: {values[-5:]}")
-                return values
-        except Exception as e:
-            log.debug(f"Script extraction failed: {e}")
-
-        # Strategy 4: Regex on page source
-        try:
-            page = self.driver.page_source
-            patterns = [
-                r'series\s*:\s*\[\s*\{[^}]*data\s*:\s*(\[[^\]]+\])',
-                r'"data"\s*:\s*(\[\s*\[\d[\d\s,.\[\]]+\])',
-                r'data\s*:\s*(\[\s*\[\s*\d{10,13}\s*,\s*\d+.*?\]\s*\])',
-            ]
-            for pat in patterns:
-                m = re.search(pat, page, re.DOTALL)
-                if m:
-                    parsed = json.loads(m.group(1))
-                    if isinstance(parsed, list) and parsed:
-                        if isinstance(parsed[0], list):
-                            values = [float(p[1]) for p in parsed]
-                        else:
-                            values = [float(v) for v in parsed]
-                        log.info(f"Layer 1: Regex → {len(values)} values, last 5: {values[-5:]}")
-                        return values
-        except Exception:
-            pass
+            log.debug(f"Highcharts extraction failed: {e}")
 
         log.warning("Layer 1: No chart data extracted")
         return []
@@ -413,46 +356,96 @@ class Agent1:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(SCREENSHOT_DIR, f"chart_{ts}.png")
 
-        rect = self.driver.execute_script("""
-            var all = document.querySelectorAll('*');
-            var heading = null;
-            for (var i = 0; i < all.length; i++) {
-                var t = all[i].innerText || '';
-                if (t.includes('outages reported in the last 24 hours') && t.length < 200) {
-                    heading = all[i];
-                    break;
+        # Fix missing gradient + force chart colors (headless Chrome doesn't resolve CSS vars/gradients)
+        self.driver.execute_script("""
+            // Inject missing gradient into SVG defs
+            var svg = document.querySelector('svg.recharts-surface');
+            if (svg) {
+                var defs = svg.querySelector('defs');
+                if (defs) {
+                    var grad = document.createElementNS('http://www.w3.org/2000/svg', 'linearGradient');
+                    grad.setAttribute('id', 'gradientBlueLight');
+                    grad.setAttribute('x1', '0'); grad.setAttribute('y1', '0');
+                    grad.setAttribute('x2', '0'); grad.setAttribute('y2', '1');
+                    var stop1 = document.createElementNS('http://www.w3.org/2000/svg', 'stop');
+                    stop1.setAttribute('offset', '0%');
+                    stop1.setAttribute('stop-color', '#22d3ee');
+                    stop1.setAttribute('stop-opacity', '0.6');
+                    var stop2 = document.createElementNS('http://www.w3.org/2000/svg', 'stop');
+                    stop2.setAttribute('offset', '100%');
+                    stop2.setAttribute('stop-color', '#22d3ee');
+                    stop2.setAttribute('stop-opacity', '0.05');
+                    grad.appendChild(stop1);
+                    grad.appendChild(stop2);
+                    defs.appendChild(grad);
                 }
             }
-            if (!heading) return null;
+            // Fix area stroke
+            var curves = document.querySelectorAll('.recharts-area-curve');
+            for (var i = 0; i < curves.length; i++) {
+                curves[i].setAttribute('stroke', '#06b6d4');
+                curves[i].setAttribute('stroke-width', '2');
+            }
+            // Fix baseline dashed line
+            var lines = document.querySelectorAll('.recharts-line-curve');
+            for (var i = 0; i < lines.length; i++) {
+                lines[i].setAttribute('stroke', '#374151');
+                lines[i].setAttribute('stroke-width', '2');
+                lines[i].setAttribute('stroke-dasharray', '8 4');
+            }
+        """)
+        time.sleep(1)
 
-            var parent = heading;
-            var chart = null;
-            for (var j = 0; j < 10; j++) {
-                parent = parent.parentElement;
-                if (!parent) break;
-                chart = parent.querySelector('svg.highcharts-root')
-                     || parent.querySelector('.highcharts-container')
-                     || parent.querySelector('svg')
-                     || parent.querySelector('canvas');
-                if (chart) break;
+        # Scroll chart into view first
+        self.driver.execute_script("""
+            var wrapper = document.querySelector('.recharts-wrapper');
+            if (wrapper) {
+                wrapper.scrollIntoView({block: 'center'});
+            }
+        """)
+        time.sleep(1)
+
+        rect = self.driver.execute_script("""
+            // Find the chart container (heading + recharts wrapper)
+            var wrapper = document.querySelector('.recharts-wrapper');
+            if (!wrapper) return null;
+
+            // Find the heading above the chart
+            var heading = null;
+            var el = wrapper;
+            for (var i = 0; i < 10; i++) {
+                el = el.parentElement;
+                if (!el) break;
+                var texts = el.querySelectorAll('*');
+                for (var j = 0; j < texts.length; j++) {
+                    var t = (texts[j].innerText || '').trim();
+                    if ((t.includes('problems reported in the last 24 hours') || t.includes('outages reported in the last 24 hours')) && t.length < 200) {
+                        heading = texts[j];
+                        break;
+                    }
+                }
+                if (heading) break;
             }
 
-            var hRect = heading.getBoundingClientRect();
-            var top = hRect.top - 15;
-            var bottom;
-            if (chart) {
-                var cRect = chart.getBoundingClientRect();
-                bottom = cRect.bottom + 30;
+            var wRect = wrapper.getBoundingClientRect();
+            var top, left, width, bottom;
+
+            if (heading) {
+                var hRect = heading.getBoundingClientRect();
+                top = hRect.top - 10;
+                left = Math.min(hRect.left, wRect.left) - 10;
+                width = Math.max(hRect.width, wRect.width) + 20;
             } else {
-                bottom = top + 500;
+                top = wRect.top - 40;
+                left = wRect.left - 10;
+                width = wRect.width + 20;
             }
-            var left = hRect.left - 10;
-            var width = Math.min(hRect.width + 20, window.innerWidth - left);
+            bottom = wRect.bottom + 5;
 
             return {
                 x: left + window.scrollX,
                 y: top + window.scrollY,
-                width: width,
+                width: Math.min(width, window.innerWidth),
                 height: bottom - top
             };
         """)
@@ -644,6 +637,34 @@ class Agent1:
         # Scroll to chart to trigger lazy loading
         self.driver.execute_script("window.scrollTo(0, 400);")
         time.sleep(2)
+
+        # Wait for Recharts chart to render
+        chart_ready = False
+        for attempt in range(20):
+            chart_ready = self.driver.execute_script("""
+                // Check for Recharts (new Downdetector UI)
+                var rc = document.querySelector('.recharts-wrapper svg.recharts-surface');
+                if (rc && rc.querySelectorAll('path').length > 0) return 'recharts';
+                // Fallback: any large SVG with paths
+                var svgs = document.querySelectorAll('svg');
+                for (var i = 0; i < svgs.length; i++) {
+                    var r = svgs[i].getBoundingClientRect();
+                    if (r.width > 300 && r.height > 100 && svgs[i].querySelectorAll('path').length > 2) return 'svg';
+                }
+                return false;
+            """)
+            if chart_ready:
+                log.info(f"[{service_name}] Chart rendered via {chart_ready} (attempt {attempt + 1})")
+                break
+            # Try dismissing cookies again mid-wait (may be blocking)
+            if attempt == 5:
+                self._dismiss_cookies()
+                self.driver.execute_script("window.scrollTo(0, 400);")
+            time.sleep(2)
+        if not chart_ready:
+            log.warning(f"[{service_name}] Chart did not render after 40s")
+        # Extra wait for animations to finish
+        time.sleep(3)
 
         # ========================
         # LAYER 1: Try to extract chart data (quick attempt)
@@ -856,22 +877,22 @@ def run_test():
                 agent.driver.execute_script("window.scrollTo(0, 400);")
                 time.sleep(2)
 
-                for attempt in range(10):
-                    has_chart = agent.driver.execute_script("""
+                for attempt in range(20):
+                    chart_ready = agent.driver.execute_script("""
+                        var rc = document.querySelector('.recharts-wrapper svg.recharts-surface');
+                        if (rc && rc.querySelectorAll('path').length > 0) return true;
                         var svgs = document.querySelectorAll('svg');
                         for (var i = 0; i < svgs.length; i++) {
-                            var paths = svgs[i].querySelectorAll(
-                                'path.highcharts-area, path.highcharts-graph, '
-                                + 'rect.highcharts-point, .highcharts-series path'
-                            );
-                            if (paths.length > 0) return true;
+                            var r = svgs[i].getBoundingClientRect();
+                            if (r.width > 300 && r.height > 100 && svgs[i].querySelectorAll('path').length > 2) return true;
                         }
                         return false;
                     """)
-                    if has_chart:
+                    if chart_ready:
+                        print(f"    Chart ready (attempt {attempt + 1})")
                         break
                     time.sleep(2)
-                time.sleep(2)
+                time.sleep(3)
 
                 # Layer 1: Extract data
                 chart_values = agent._extract_chart_data()
@@ -944,27 +965,10 @@ def run_test():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Agent 1 — UPI Downtime Monitor")
-    parser.add_argument("--test", action="store_true", help="Run tests and exit")
-    parser.add_argument("--once", action="store_true", help="Check all services once and exit")
+    parser.add_argument("--test", action="store_true", help="Run one cycle and exit")
     args = parser.parse_args()
 
     if args.test:
         run_test()
-    elif args.once:
-        # Single run mode (for GitHub Actions / cron)
-        agent = Agent1()
-        agent._start_browser()
-        try:
-            for name, url in SERVICES.items():
-                try:
-                    agent.check_once(name, url)
-                except Exception as e:
-                    log.error(f"[{name}] Check failed: {e}")
-                    agent._stop_browser()
-                    agent._start_browser()
-                time.sleep(5)
-        finally:
-            agent._stop_browser()
-        log.info("Single run complete.")
     else:
         Agent1().run()
