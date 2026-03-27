@@ -965,10 +965,26 @@ def run_test():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Agent 1 — UPI Downtime Monitor")
-    parser.add_argument("--test", action="store_true", help="Run one cycle and exit")
+    parser.add_argument("--test", action="store_true", help="Run tests and exit")
+    parser.add_argument("--once", action="store_true", help="Check all services once and exit (for GitHub Actions)")
     args = parser.parse_args()
 
     if args.test:
         run_test()
+    elif args.once:
+        agent = Agent1()
+        agent._start_browser()
+        try:
+            for name, url in SERVICES.items():
+                try:
+                    agent.check_once(name, url)
+                except Exception as e:
+                    log.error(f"[{name}] Check failed: {e}")
+                    agent._stop_browser()
+                    agent._start_browser()
+                time.sleep(5)
+        finally:
+            agent._stop_browser()
+        log.info("Single run complete.")
     else:
         Agent1().run()
