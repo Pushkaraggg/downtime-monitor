@@ -66,9 +66,8 @@ SERVICES = {
 CHECK_INTERVAL = 5 * 60                   # 5 minutes
 
 # Spike detection config
-SPIKE_MULTIPLIER = 5        # current must be 5x the recent average
-SUDDEN_JUMP_RATIO = 3       # current vs previous reading (sudden = 3x+)
-MIN_SPIKE_VALUE = 10         # ignore spikes below this many reports
+SPIKE_MULTIPLIER = 3        # current must be 3x the recent average
+SUDDEN_JUMP_RATIO = 2       # current vs previous reading (sudden = 2x+)
 
 # Groq Vision API (FREE — https://console.groq.com)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
