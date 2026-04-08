@@ -45,11 +45,17 @@ if os.path.exists(_env_path):
                 os.environ.setdefault(_k.strip(), _v.strip())
 
 import requests
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+
+# Use undetected-chromedriver on Linux (GitHub Actions) to bypass Cloudflare
+# Use regular selenium on Windows (local) with off-screen window
+if os.name == "nt":
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+else:
+    import undetected_chromedriver as uc
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -225,32 +231,38 @@ class Agent1:
     # BROWSER
     # -----------------------------------------------------------------
     def _start_browser(self):
-        opts = Options()
-        # Auto-detect: headless on Linux (GitHub Actions), off-screen on Windows (local)
         if os.name == "nt":
-            # Windows: real window off-screen (bypasses Cloudflare)
+            # Windows: regular selenium, off-screen window (bypasses Cloudflare)
+            opts = Options()
             opts.add_argument("--window-position=-3000,-3000")
+            opts.add_argument("--disable-gpu")
+            opts.add_argument("--no-sandbox")
+            opts.add_argument("--disable-dev-shm-usage")
+            opts.add_argument("--window-size=1920,1080")
+            opts.add_argument("--disable-blink-features=AutomationControlled")
+            opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+            opts.add_experimental_option("useAutomationExtension", False)
+            chrome_bin = os.environ.get("CHROME_BIN")
+            if chrome_bin:
+                opts.binary_location = chrome_bin
+            self.driver = webdriver.Chrome(options=opts)
+            self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            })
+            log.info("Chrome started (off-screen window)")
         else:
-            # Linux/GitHub Actions: headless (no display available)
-            opts.add_argument("--headless=new")
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--window-size=1920,1080")
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension", False)
-        chrome_bin = os.environ.get("CHROME_BIN")
-        if chrome_bin:
-            opts.binary_location = chrome_bin
-        self.driver = webdriver.Chrome(options=opts)
-        # Anti-bot detection
-        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": """
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            """
-        })
-        log.info("Chrome started (minimized window)")
+            # Linux/GitHub Actions: undetected-chromedriver (bypasses Cloudflare headless)
+            options = uc.ChromeOptions()
+            options.add_argument("--headless=new")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--window-size=1920,1080")
+            chrome_bin = os.environ.get("CHROME_BIN")
+            if chrome_bin:
+                options.binary_location = chrome_bin
+            self.driver = uc.Chrome(options=options, headless=True)
+            log.info("Chrome started (undetected headless)")
 
     def _stop_browser(self):
         if self.driver:
